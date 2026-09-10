@@ -49,6 +49,7 @@ class BotRunner:
         self.lot_size: dict[str, float] = {}
         self.min_size: dict[str, float] = {}
         self.symbols: list[str] = []
+        self.blocked_symbols: set[str] = set()
 
     async def _log(self, symbol: str, decision: str, reason: str, details: dict | None = None) -> None:
         async with SessionLocal() as session:
@@ -160,6 +161,8 @@ class BotRunner:
             await self._check_exits(inst_id, data.last_price)
 
     async def _evaluate_symbol(self, symbol: str, signal_price: float | None = None) -> None:
+        if symbol in self.blocked_symbols:
+            return
         config = await get_or_create_config()
         state = await get_or_create_state()
         data = self.store.get(symbol)
@@ -259,7 +262,11 @@ class BotRunner:
                     return
                 fill_price, base_size = filled
             except OKXError as exc:
-                await self._log(symbol, "error", f"order_failed:{exc}", {})
+                if "trading permission" in str(exc) or "50123" in str(exc):
+                    self.blocked_symbols.add(symbol)
+                    await self._log(symbol, "error", f"order_failed_blocked_permanently:{exc}", {})
+                else:
+                    await self._log(symbol, "error", f"order_failed:{exc}", {})
                 return
         else:
             fill_price = price
