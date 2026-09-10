@@ -12,6 +12,8 @@ logger = logging.getLogger("okx.ws_public")
 
 Callback = Callable[[dict], Awaitable[None]]
 
+_BATCH_SIZE = 250  # OKX يحدد حجم طلب الاشتراك، نُرسل على دفعات لدعم مسح السوق كاملاً.
+
 
 class _OKXWSConnection:
     """اتصال WebSocket عام قابل لإعادة الاستخدام لأي نقطة اتصال (public أو business)."""
@@ -40,9 +42,12 @@ class _OKXWSConnection:
         while not self._stop:
             try:
                 async with websockets.connect(self.url, ping_interval=None) as ws:
-                    logger.info("OKX %s WS connected", self.label)
+                    logger.info("OKX %s WS connected; channels=%s", self.label, len(self.subscribe_args))
                     backoff = 2
-                    await ws.send(json.dumps({"op": "subscribe", "args": self.subscribe_args}))
+                    for i in range(0, len(self.subscribe_args), _BATCH_SIZE):
+                        batch = self.subscribe_args[i:i + _BATCH_SIZE]
+                        await ws.send(json.dumps({"op": "subscribe", "args": batch}))
+                        await asyncio.sleep(0.1)
                     ping_task = asyncio.create_task(self._pinger(ws))
                     try:
                         async for raw in ws:
@@ -70,11 +75,16 @@ class _OKXWSConnection:
 
 
 class OKXPublicWS:
-    """يشترك في قنوات candle15m (عبر business)، books وtickers (عبر public) لقائمة أزواج."""
+    """يشترك في candle{timeframe} عبر نقطة business، وtickers عبر نقطة public، لأي عدد من الأزواج.
 
-    def __init__(self, symbols: list[str], on_message: Callback) -> None:
+    دفتر الأوامر لا يُشترك فيه عبر WS (غير عملي لمسح السوق كاملاً)؛ يُجلب بالـ REST
+    عند الحاجة فقط لزوج مرشّح لصفقة (انظر bot_runner._evaluate_symbol).
+    """
+
+    def __init__(self, symbols: list[str], on_message: Callback, timeframe: str = "15m") -> None:
         self.symbols = symbols
         self.on_message = on_message
+        self.timeframe = timeframe
         self._public = _OKXWSConnection(self._public_url(), self._public_args(), on_message, "public")
         self._business = _OKXWSConnection(self._business_url(), self._business_args(), on_message, "business")
 
@@ -89,14 +99,10 @@ class OKXPublicWS:
         return "wss://ws.okx.com:8443/ws/v5/business"
 
     def _public_args(self) -> list[dict]:
-        args = []
-        for sym in self.symbols:
-            args.append({"channel": "books", "instId": sym})
-            args.append({"channel": "tickers", "instId": sym})
-        return args
+        return [{"channel": "tickers", "instId": sym} for sym in self.symbols]
 
     def _business_args(self) -> list[dict]:
-        return [{"channel": "candle15m", "instId": sym} for sym in self.symbols]
+        return [{"channel": f"candle{self.timeframe}", "instId": sym} for sym in self.symbols]
 
     async def start(self) -> None:
         await self._public.start()

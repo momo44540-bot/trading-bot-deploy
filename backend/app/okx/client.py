@@ -84,6 +84,12 @@ class OKXClient:
                                     params={"instType": "SPOT", "instId": inst_id}, signed=False)
         return data["data"][0]
 
+    async def get_spot_usdt_instruments(self) -> list[dict]:
+        """جميع أزواج Spot الحية التي عملة التسعير فيها USDT."""
+        data = await self._request("GET", "/api/v5/public/instruments",
+                                    params={"instType": "SPOT"}, signed=False)
+        return [x for x in data["data"] if x.get("quoteCcy") == "USDT" and x.get("state") == "live"]
+
     # ---- حساب وأوامر (تحتاج توقيع) ----
 
     async def get_balance(self, ccy: str | None = None) -> dict:

@@ -38,13 +38,18 @@ class EntrySignal:
 
 @dataclass
 class StrategyParams:
+    # السعر فوق VWAP + تأكيد واحد على الأقل (حجم أو ضغط دفتر أوامر).
     orderbook_depth_levels: int = 20
     orderbook_ratio_threshold: float = 1.0
     volume_avg_lookback: int = 20
     volume_ratio_threshold: float = 1.0
 
+    # حماية من الشراء بعد اندفاع السعر بعيدًا جدًا عن VWAP.
+    max_distance_above_vwap_pct: float = 2.0
 
-def evaluate_entry(data: SymbolMarketData, params: StrategyParams) -> EntrySignal:
+
+def evaluate_entry(data: SymbolMarketData, params: StrategyParams, *,
+                    orderbook_required: bool = False) -> EntrySignal:
     if data.last_price is None or not data.candles:
         return EntrySignal(False, None, None, None, None, "insufficient_data")
 
@@ -52,27 +57,36 @@ def evaluate_entry(data: SymbolMarketData, params: StrategyParams) -> EntrySigna
     vol_ratio = volume_ratio(data.candles, lookback=params.volume_avg_lookback)
     ob_ratio = orderbook_pressure(data.bids, data.asks, depth=params.orderbook_depth_levels)
 
-    if vwap is None or vol_ratio is None or ob_ratio is None:
-        return EntrySignal(False, None, vwap, ob_ratio, vol_ratio, "insufficient_data")
+    if vwap is None:
+        return EntrySignal(False, None, None, ob_ratio, vol_ratio, "vwap_unavailable")
 
     price_above_vwap = data.last_price > vwap
-    orderbook_positive = ob_ratio > params.orderbook_ratio_threshold
-    volume_positive = vol_ratio > params.volume_ratio_threshold
+    distance_pct = ((data.last_price - vwap) / vwap * 100) if vwap else 999.0
 
-    should_enter = price_above_vwap and orderbook_positive and volume_positive
-    if should_enter:
-        reason = "all_conditions_met"
+    if not price_above_vwap:
+        return EntrySignal(False, False, vwap, ob_ratio, vol_ratio, "price_below_vwap")
+
+    if distance_pct > params.max_distance_above_vwap_pct:
+        return EntrySignal(False, True, vwap, ob_ratio, vol_ratio, "price_too_far_above_vwap")
+
+    volume_positive = vol_ratio is not None and vol_ratio >= params.volume_ratio_threshold
+    orderbook_positive = ob_ratio is not None and ob_ratio >= params.orderbook_ratio_threshold
+
+    # السعر فوق VWAP + (حجم جيد OR دفتر أوامر جيد).
+    if not orderbook_required and volume_positive:
+        return EntrySignal(True, True, vwap, ob_ratio, vol_ratio, "vwap_plus_volume")
+
+    if orderbook_positive:
+        return EntrySignal(True, True, vwap, ob_ratio, vol_ratio, "vwap_plus_orderbook")
+
+    if vol_ratio is None and ob_ratio is None:
+        reason = "no_confirmation_data"
+    elif not volume_positive and not orderbook_positive:
+        reason = "no_confirmation"
     else:
-        failed = []
-        if not price_above_vwap:
-            failed.append("price_below_vwap")
-        if not orderbook_positive:
-            failed.append("orderbook_pressure_not_positive")
-        if not volume_positive:
-            failed.append("volume_not_above_average")
-        reason = ",".join(failed)
+        reason = "confirmation_not_met"
 
-    return EntrySignal(should_enter, price_above_vwap, vwap, ob_ratio, vol_ratio, reason)
+    return EntrySignal(False, True, vwap, ob_ratio, vol_ratio, reason)
 
 
 @dataclass

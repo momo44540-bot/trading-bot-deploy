@@ -47,6 +47,8 @@ class BotRunner:
         self._running = False
         self._lock = asyncio.Lock()
         self.lot_size: dict[str, float] = {}
+        self.min_size: dict[str, float] = {}
+        self.symbols: list[str] = []
 
     async def _log(self, symbol: str, decision: str, reason: str, details: dict | None = None) -> None:
         async with SessionLocal() as session:
@@ -57,6 +59,21 @@ class BotRunner:
             "reason": reason, "details": details or {},
             "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
         })
+
+    async def _load_all_usdt_symbols(self) -> list[str]:
+        instruments = await okx_client.get_spot_usdt_instruments()
+        self.lot_size = {}
+        self.min_size = {}
+        symbols: list[str] = []
+        for item in instruments:
+            symbol = item["instId"]
+            symbols.append(symbol)
+            try:
+                self.lot_size[symbol] = float(item.get("lotSz") or 0)
+                self.min_size[symbol] = float(item.get("minSz") or 0)
+            except (TypeError, ValueError):
+                pass
+        return sorted(set(symbols))
 
     async def start(self) -> None:
         async with self._lock:
@@ -70,14 +87,31 @@ class BotRunner:
                 session.add(state)
                 await session.commit()
 
-            for symbol in config.symbols:
-                await self._preload_candles(symbol, config.timeframe)
-                await self._preload_instrument(symbol)
+            try:
+                self.symbols = await self._load_all_usdt_symbols()
+            except OKXError as exc:
+                await self._log("SYSTEM", "error", f"load_all_symbols_failed:{exc}", {})
+                return
 
-            self.ws = OKXPublicWS(config.symbols, self._on_ws_message)
+            if not self.symbols:
+                await self._log("SYSTEM", "error", "no_live_usdt_spot_symbols", {})
+                return
+
+            semaphore = asyncio.Semaphore(10)
+
+            async def preload(symbol: str) -> None:
+                async with semaphore:
+                    await self._preload_candles(symbol, config.timeframe)
+
+            await asyncio.gather(*(preload(s) for s in self.symbols))
+
+            self.ws = OKXPublicWS(self.symbols, self._on_ws_message, timeframe=config.timeframe)
             await self.ws.start()
             self._running = True
-            await self._log("SYSTEM", "info", "bot_started", {"symbols": config.symbols})
+            await self._log("SYSTEM", "info", "bot_started_all_usdt_spot", {
+                "symbols_count": len(self.symbols), "timeframe": config.timeframe,
+                "strategy": "VWAP + volume OR orderbook",
+            })
 
     async def stop(self) -> None:
         async with self._lock:
@@ -105,13 +139,6 @@ class BotRunner:
         except OKXError as exc:
             logger.warning("failed to preload candles for %s: %s", symbol, exc)
 
-    async def _preload_instrument(self, symbol: str) -> None:
-        try:
-            instrument = await okx_client.get_instrument(symbol)
-            self.lot_size[symbol] = float(instrument["lotSz"])
-        except (OKXError, KeyError, ValueError) as exc:
-            logger.warning("failed to preload instrument info for %s: %s", symbol, exc)
-
     async def _on_ws_message(self, msg: dict) -> None:
         channel = msg.get("arg", {}).get("channel")
         inst_id = msg.get("arg", {}).get("instId")
@@ -119,29 +146,20 @@ class BotRunner:
             return
         data = self.store.get(inst_id)
 
-        if channel == "candle15m":
+        if channel.startswith("candle"):
             row = msg["data"][0]
             candle = Candle.from_okx(row)
             is_confirmed = row[-1] == "1"
             data.add_candle(candle, is_update=not is_confirmed)
             if is_confirmed:
-                await self._evaluate_symbol(inst_id)
-
-        elif channel == "books":
-            book = msg["data"][0]
-            if msg.get("action") == "snapshot":
-                data.bids = book.get("bids", [])
-                data.asks = book.get("asks", [])
-            else:
-                data.bids = book.get("bids", data.bids)
-                data.asks = book.get("asks", data.asks)
+                await self._evaluate_symbol(inst_id, signal_price=candle.close)
 
         elif channel == "tickers":
             ticker = msg["data"][0]
             data.last_price = float(ticker["last"])
             await self._check_exits(inst_id, data.last_price)
 
-    async def _evaluate_symbol(self, symbol: str) -> None:
+    async def _evaluate_symbol(self, symbol: str, signal_price: float | None = None) -> None:
         config = await get_or_create_config()
         state = await get_or_create_state()
         data = self.store.get(symbol)
@@ -154,19 +172,41 @@ class BotRunner:
         if existing is not None:
             return
 
+        if signal_price is not None:
+            original_price = data.last_price
+            data.last_price = signal_price
+        else:
+            original_price = None
+
         params = StrategyParams(
             orderbook_depth_levels=config.orderbook_depth_levels,
             orderbook_ratio_threshold=config.orderbook_ratio_threshold,
             volume_avg_lookback=config.volume_avg_lookback,
             volume_ratio_threshold=config.volume_ratio_threshold,
+            max_distance_above_vwap_pct=2.0,
         )
+
+        # تقييم أولي: VWAP + الحجم فقط، بدون بث دفتر أوامر مستمر لكل عملة (غير عملي لمسح السوق كاملاً).
         signal = evaluate_entry(data, params)
+
+        # إذا لم يكفِ الحجم، نمنح دفتر الأوامر فرصة تأكيد (جلب REST عند الحاجة فقط).
+        if not signal.should_enter and signal.reason == "no_confirmation":
+            try:
+                book = await okx_client.get_order_book(symbol, depth=config.orderbook_depth_levels)
+                data.bids = book.get("bids", [])
+                data.asks = book.get("asks", [])
+                signal = evaluate_entry(data, params, orderbook_required=True)
+            except OKXError as exc:
+                await self._log(symbol, "reject", "orderbook_fetch_failed", {"error": str(exc)})
+
         details = {
             "price": data.last_price, "vwap": signal.vwap,
             "orderbook_ratio": signal.orderbook_ratio, "volume_ratio": signal.volume_ratio_value,
         }
         if not signal.should_enter:
             await self._log(symbol, "reject", signal.reason, details)
+            if original_price is not None:
+                data.last_price = original_price
             return
 
         async with SessionLocal() as session:
@@ -181,12 +221,16 @@ class BotRunner:
         risk_decision = check_can_open(limits, symbol, open_symbols, state.kill_switch, state.daily_loss_limit_hit)
         if not risk_decision.allowed:
             await self._log(symbol, "reject", risk_decision.reason, details)
+            if original_price is not None:
+                data.last_price = original_price
             return
 
-        await self._open_position(symbol, data.last_price, config, state, limits)
+        await self._open_position(symbol, data.last_price, config, state, limits, signal.reason)
+        if original_price is not None:
+            data.last_price = original_price
 
     async def _open_position(self, symbol: str, price: float, config: StrategyConfig,
-                              state: BotState, limits: RiskLimits) -> None:
+                              state: BotState, limits: RiskLimits, signal_reason: str) -> None:
         if state.trading_mode == "live":
             try:
                 balance = await okx_client.get_balance("USDT")
@@ -238,13 +282,13 @@ class BotRunner:
                 session.add(db_state)
             await session.commit()
 
-        await self._log(symbol, "entry", "conditions_met", {
+        await self._log(symbol, "entry", signal_reason, {
             "entry_price": fill_price, "size": base_size, "quote_spent": quote_size,
             "take_profit_price": tp_price, "stop_loss_price": sl_price, "mode": state.trading_mode,
         })
         await broadcaster.publish({"type": "position_opened", "symbol": symbol})
 
-    async def _poll_fill(self, symbol: str, order_id: str, attempts: int = 5) -> tuple[float, float] | None:
+    async def _poll_fill(self, symbol: str, order_id: str, attempts: int = 8) -> tuple[float, float] | None:
         for _ in range(attempts):
             await asyncio.sleep(1)
             try:
@@ -295,6 +339,9 @@ class BotRunner:
 
         pnl_quote = (exit_price - position.entry_price) * position.size
         realized_pct = (exit_price - position.entry_price) / position.entry_price * 100
+        config = await get_or_create_config()
+        # تحويل عائد الصفقة إلى مساهمة تقريبية على مستوى المحفظة، لأغراض حد الخسارة اليومي.
+        portfolio_pnl_pct = realized_pct * config.position_size_pct / 100
 
         async with SessionLocal() as session:
             db_position = await session.get(Position, position.id)
@@ -315,14 +362,15 @@ class BotRunner:
                 db_state.daily_pnl_date = today
                 db_state.daily_realized_pnl_pct = 0.0
                 db_state.daily_loss_limit_hit = False
-            db_state.daily_realized_pnl_pct += realized_pct
-            limits = RiskLimits(daily_loss_limit_pct=(await get_or_create_config()).daily_loss_limit_pct)
+            db_state.daily_realized_pnl_pct += portfolio_pnl_pct
+            limits = RiskLimits(daily_loss_limit_pct=config.daily_loss_limit_pct)
             db_state.daily_loss_limit_hit = update_daily_loss_state(db_state.daily_realized_pnl_pct, limits)
             session.add(db_state)
             await session.commit()
 
         await self._log(position.symbol, "exit", reason, {
             "exit_price": exit_price, "pnl_quote": pnl_quote, "pnl_pct": realized_pct,
+            "portfolio_pnl_pct": portfolio_pnl_pct,
         })
         await broadcaster.publish({"type": "position_closed", "symbol": position.symbol, "reason": reason})
 
